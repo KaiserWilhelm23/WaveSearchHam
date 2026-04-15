@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>WaveSearch - Amateur Radio Dataset</title>
+<style>
+body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f4f6f8; color: #333; margin:0; padding:20px;}
+header { display:flex; justify-content:space-between; align-items:center; margin-bottom:30px;}
+header h1 { color:#1a73e8; margin:0; }
+header nav a { text-decoration:none; color:#1a73e8; margin-left:15px; font-weight:bold; }
+header nav a:hover { color:#155ab6; }
+.container { max-width:1200px; margin:0 auto; }
+.search-card { background:#fff; padding:20px; border-radius:12px; box-shadow:0 4px 12px rgba(0,0,0,0.08); margin-bottom:20px; }
+.search-card input, .search-card select { padding:10px 12px; margin:6px 6px 6px 0; font-size:1em; border:1px solid #ccc; border-radius:6px; width:160px; }
+.search-card button { background-color:#1a73e8; color:#fff; border:none; border-radius:6px; cursor:pointer; padding:10px 14px; margin:6px 0; font-weight:bold; }
+.search-card button:hover { background-color:#155ab6; }
+#results { overflow-x:auto; }
+table { width:100%; border-collapse:collapse; margin-top:10px; min-width:700px; cursor:default; }
+th, td { border:1px solid #ddd; padding:10px 12px; text-align:left; }
+th { background-color:#1a73e8; color:#fff; position:sticky; top:0; z-index:1; cursor:pointer; user-select:none; }
+tr:nth-child(even) { background-color:#f2f2f2; }
+tr:hover { background-color:#dce7ff; }
+a { color:#1a73e8; text-decoration:none; }
+a:hover { text-decoration:underline; }
+.pagination-controls { margin-top:10px; text-align:center; }
+.pagination-controls input { width:50px; padding:5px; margin-left:5px; margin-right:5px; border-radius:4px; border:1px solid #ccc; }
+#map { height:500px; display:none; margin-top:20px; }
+@media(max-width:768px) { .search-card input { width:100%; margin-bottom:8px; } .search-card button { width:48%; margin-right:4%; } }
+</style>
+
+<link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css"/>
+<link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster/dist/MarkerCluster.css" />
+<link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster/dist/MarkerCluster.Default.css" />
+</head>
+<body>
+
+<header>
+    <h1>WaveSearch - Amateur Radio Dataset</h1>
+</header>
+
+<div class="container">
+    <div class="search-card">
+        <input type="text" id="call_sign" placeholder="Call Sign">
+        <input type="text" id="name" placeholder="Name">
+        <input type="text" id="street" placeholder="Street">
+        <input type="text" id="city" placeholder="City">
+        <input type="text" id="state" placeholder="State">
+        <input type="text" id="zip" placeholder="ZIP">
+        <br>
+        <button onclick="search()">Search</button>
+        <button onclick="clearFilters()">Clear</button>
+        <button onclick="downloadCSV(currentMatches,'search_results.csv')">Download Search CSV</button>
+        <button onclick="showTable()">Table View</button>
+        <button onclick="showMap()">Map View</button>
+        <label style="margin-left:10px;">
+            Results per page:
+            <select id="resultsPerPage" onchange="renderResults()">
+                <option value="25">25</option>
+                <option value="50" selected>50</option>
+                <option value="100">100</option>
+            </select>
+        </label>
+    </div>
+
+    <div id="map"></div>
+    <div id="results"></div>
+</div>
+
+<script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+<script src="https://unpkg.com/leaflet.markercluster/dist/leaflet.markercluster.js"></script>
+
+<script>
+let currentMatches = [];
+let currentPage = 1;
+let sortField = null;
+let sortAsc = true;
+let map, markers;
+
+async function search(){
+    currentPage=1; sortField=null; sortAsc=true;
+    const params={dataset:"amateur_calls"};
+    ['call_sign','name','street','city','state','zip'].forEach(f=>{
+        const val=document.getElementById(f).value.trim();
+        if(val) params[f]=val;
+    });
+    const resultsDiv=document.getElementById('results');
+    resultsDiv.innerHTML="<p>Searching server...</p>";
+    try{
+        const response=await fetch('/search',{
+            method:'POST',
+            headers:{'Content-Type':'application/json'},
+            body:JSON.stringify(params)
+        });
+        if(!response.ok){ resultsDiv.innerHTML=`<p>Server returned error ${response.status}</p>`; return; }
+        currentMatches=await response.json();
+        if(!currentMatches.length){ resultsDiv.innerHTML='<p>No matches found.</p>'; return; }
+        renderResults();
+    } catch(err){ console.error(err); resultsDiv.innerHTML="<p>Server search failed.</p>"; }
+}
+
+function sortBy(field){
+    if(sortField===field) sortAsc=!sortAsc;
+    else{ sortField=field; sortAsc=true; }
+    currentMatches.sort((a,b)=>{
+        const valA=(a[field]||"").toLowerCase();
+        const valB=(b[field]||"").toLowerCase();
+        return valA<valB ? (sortAsc?-1:1) : valA>valB ? (sortAsc?1:-1) :0;
+    });
+    renderResults();
+}
+
+function renderResults(){
+    const resultsDiv=document.getElementById('results');
+    resultsDiv.innerHTML="";
+    const perPage=parseInt(document.getElementById('resultsPerPage').value);
+    const totalPages=Math.ceil(currentMatches.length/perPage);
+    if(currentPage>totalPages) currentPage=totalPages||1;
+    const startIdx=(currentPage-1)*perPage;
+    const pageMatches=currentMatches.slice(startIdx,startIdx+perPage);
+
+    const totalInfo=document.createElement('p');
+    totalInfo.textContent=`Showing ${startIdx+1}-${Math.min(startIdx+perPage,currentMatches.length)} of ${currentMatches.length} records`;
+    resultsDiv.appendChild(totalInfo);
+
+    const table=document.createElement('table');
+    const header=document.createElement('tr');
+    const columns=['call_sign','name','street','city','state','zip'];
+    const columnNames=['Call Sign','Name','Street','City','State','ZIP'];
+    columns.forEach((col,i)=>{
+        const th=document.createElement('th');
+        th.textContent=columnNames[i];
+        th.onclick=()=>sortBy(col);
+        header.appendChild(th);
+    });
+    table.appendChild(header);
+
+    pageMatches.forEach(rec=>{
+        const tr=document.createElement('tr');
+        columns.forEach(f=>{
+            const td=document.createElement('td');
+            if(f==='call_sign' && rec[f]){
+                const a=document.createElement('a');
+                a.href=`https://www.qrz.com/db/${rec[f]}`;
+                a.textContent=rec[f];
+                a.target="_blank";
+                td.appendChild(a);
+            } else td.textContent=rec[f]||'';
+            tr.appendChild(td);
+        });
+        table.appendChild(tr);
+    });
+    resultsDiv.appendChild(table);
+
+    if(totalPages>1){
+        const nav=document.createElement('div'); nav.className="pagination-controls";
+        const prev=document.createElement('button'); prev.textContent="Prev"; prev.disabled=currentPage===1; prev.onclick=()=>{currentPage--; renderResults();};
+        const pageInput=document.createElement('input'); pageInput.type="number"; pageInput.min=1; pageInput.max=totalPages; pageInput.value=currentPage;
+        pageInput.onchange=()=>{let val=parseInt(pageInput.value); if(val<1) val=1; if(val>totalPages) val=totalPages; currentPage=val; renderResults();};
+        const info=document.createElement('span'); info.textContent=` of ${totalPages} `;
+        const next=document.createElement('button'); next.textContent="Next"; next.disabled=currentPage===totalPages; next.onclick=()=>{currentPage++; renderResults();};
+        nav.appendChild(prev); nav.appendChild(pageInput); nav.appendChild(info); nav.appendChild(next);
+        resultsDiv.appendChild(nav);
+    }
+}
+
+// CSV Download
+function downloadCSV(data,filename){
+    if(!data || !data.length){ alert("No data to download"); return; }
+    const columns=['call_sign','name','street','city','state','zip'];
+    let csvContent=columns.join(",")+"\n";
+    data.forEach(row=>{ csvContent+=columns.map(c=>`"${(row[c]||"").replace(/"/g,'""')}"`).join(",")+"\n"; });
+    const blob=new Blob([csvContent],{type:"text/csv;charset=utf-8;"});
+    const link=document.createElement("a");
+    link.href=URL.createObjectURL(blob); link.download=filename;
+    document.body.appendChild(link); link.click(); document.body.removeChild(link);
+}
+
+async function downloadFullDB(){
+    try{
+        const response=await fetch('/search',{
+            method:'POST',
+            headers:{'Content-Type':'application/json'},
+            body:JSON.stringify({dataset:"amateur_calls"})
+        });
+        if(!response.ok){ alert("Failed to fetch full DB"); return; }
+        const allData=await response.json();
+        downloadCSV(allData,"full_amateur_calls.csv");
+    } catch(err){ console.error(err); alert("Error downloading full DB"); }
+}
+
+function clearFilters(){
+    ['call_sign','name','street','city','state','zip'].forEach(f=>document.getElementById(f).value="");
+    currentMatches=[]; currentPage=1; sortField=null; sortAsc=true;
+    document.getElementById('results').innerHTML="";
+}
+
+// --- Geocoding ---
+async function geocodeAddresses(limit=50){
+    for(let i=0;i<Math.min(limit,currentMatches.length);i++){
+        const rec=currentMatches[i];
+        if(rec.lat && rec.lon) continue;
+        let address=`${rec.street||''}, ${rec.city||''}, ${rec.state||''}, ${rec.zip||''}`.replace(/^, | ,$/g,'').trim();
+        if(!address) continue;
+        try{
+            const res=await fetch(`https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(address)}&limit=1`);
+            const data=await res.json();
+            if(data.length){ rec.lat=parseFloat(data[0].lat); rec.lon=parseFloat(data[0].lon); }
+            await new Promise(r=>setTimeout(r,1000));
+        } catch(e){ console.error("Geocode failed for", address,e); }
+    }
+}
+
+async function showMap(){
+    document.getElementById('results').style.display='none';
+    document.getElementById('map').style.display='block';
+    if(!map){
+        map=L.map('map').setView([39.0,-98.0],4);
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{ attribution:'© OpenStreetMap contributors' }).addTo(map);
+        markers=L.markerClusterGroup(); map.addLayer(markers);
+    }
+    markers.clearLayers();
+    await geocodeAddresses();
+    currentMatches.forEach(rec=>{
+        if(rec.lat && rec.lon){
+            const marker=L.marker([rec.lat,rec.lon])
+                .bindPopup(`<b>${rec.call_sign}</b><br>${rec.name}<br>${rec.street}, ${rec.city}, ${rec.state} ${rec.zip}`);
+            markers.addLayer(marker);
+        }
+    });
+    if(markers.getLayers().length) map.fitBounds(markers.getBounds());
+}
+
+function showTable(){
+    document.getElementById('map').style.display='none';
+    document.getElementById('results').style.display='block';
+}
+</script>
+
+</body>
+</html>
